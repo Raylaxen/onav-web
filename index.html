@@ -334,6 +334,13 @@ const engine = new Engine(GODOT_CONFIG);
 		}, displayFailureNotice);
 	}
 
+	// If the engine fails while starting (wasm setup, audio, WebGL), say so
+	// on the page instead of leaving the loading bar sitting at 100%.
+	window.addEventListener('unhandledrejection', function (e) {
+		console.error(e.reason);
+		displayFailureNotice(e.reason || 'The engine failed to start.');
+	});
+
 	setStatusMode('ready');
 	statusHint.textContent = totalBytes > 0
 		? mb(totalBytes) + ' — keep this tab open while it loads.'
