@@ -2,7 +2,10 @@
 <html lang="en">
 	<head>
 		<meta charset="utf-8">
-		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0">
+		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, viewport-fit=cover">
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta name="mobile-web-app-capable" content="yes">
+		<meta name="theme-color" content="#000000">
 		<title>Five Nights Fi ElView</title>
 		<style>
 html, body, #canvas {
@@ -11,15 +14,23 @@ html, body, #canvas {
 	border: 0;
 }
 
+html, body {
+	height: 100%;
+}
+
 body {
 	color: white;
 	background-color: black;
 	overflow: hidden;
 	touch-action: none;
+	-webkit-tap-highlight-color: transparent;
+	-webkit-user-select: none;
+	user-select: none;
 }
 
 #canvas {
 	display: block;
+	touch-action: none;
 }
 
 #canvas:focus {
@@ -27,7 +38,7 @@ body {
 }
 
 #status, #status-splash, #status-progress {
-	position: absolute;
+	position: fixed;
 	left: 0;
 	right: 0;
 }
@@ -44,6 +55,7 @@ body {
 	justify-content: center;
 	align-items: center;
 	visibility: hidden;
+	z-index: 2;
 }
 
 #status-splash {
@@ -66,8 +78,23 @@ body {
 	image-rendering: pixelated;
 }
 
-#status-progress, #status-notice {
+#status-progress, #status-notice, #status-start, #status-line {
 	display: none;
+}
+
+#status-line {
+	position: fixed;
+	bottom: 22%;
+	left: 0;
+	right: 0;
+	margin: 0 1.5rem;
+	color: #b9b9b9;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	font-size: 0.8rem;
+	line-height: 1.4;
+	text-align: center;
+	pointer-events: none;
+	z-index: 1;
 }
 
 #status-progress {
@@ -89,6 +116,42 @@ body {
 	text-align: center;
 	z-index: 1;
 }
+
+#status-start {
+	-webkit-appearance: none;
+	appearance: none;
+	margin: 1.5rem 0 0;
+	padding: 1.1rem 2.4rem;
+	border: 1px solid #9b3943;
+	border-radius: 0.6rem;
+	background-color: #5b3943;
+	color: #fff;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	font-size: 1.1rem;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+	cursor: pointer;
+	z-index: 2;
+}
+
+#status-start:active {
+	background-color: #7a4b58;
+}
+
+#status-hint {
+	position: fixed;
+	bottom: 18%;
+	left: 0;
+	right: 0;
+	color: #8d8d8d;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	font-size: 0.72rem;
+	line-height: 1.4;
+	margin: 0 2rem;
+	text-align: center;
+	display: none;
+	z-index: 1;
+}
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
 <link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
@@ -106,8 +169,11 @@ body {
 		<div id="status">
 			<img id="status-splash" class="show-image--false fullsize--true use-filter--true" src="index.png" alt="">
 			<progress id="status-progress"></progress>
+			<button id="status-start" type="button">Tap to play</button>
+			<div id="status-hint"></div>
 			<div id="status-notice"></div>
 		</div>
+		<div id="status-line"></div>
 
 		<script src="index.js"></script>
 		<script>
@@ -119,9 +185,15 @@ const engine = new Engine(GODOT_CONFIG);
 	const statusOverlay = document.getElementById('status');
 	const statusProgress = document.getElementById('status-progress');
 	const statusNotice = document.getElementById('status-notice');
+	const statusStart = document.getElementById('status-start');
+	const statusHint = document.getElementById('status-hint');
+	const statusLine = document.getElementById('status-line');
 
 	let initializing = true;
 	let statusMode = '';
+	let started = false;
+	let startedAt = 0;
+	let loadedBytes = 0;
 
 	function setStatusMode(mode) {
 		if (statusMode === mode || !initializing) {
@@ -129,13 +201,20 @@ const engine = new Engine(GODOT_CONFIG);
 		}
 		if (mode === 'hidden') {
 			statusOverlay.remove();
+			statusLine.remove();
 			initializing = false;
 			return;
 		}
 		statusOverlay.style.visibility = 'visible';
 		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		statusStart.style.display = mode === 'ready' ? 'block' : 'none';
+		statusHint.style.display = mode === 'ready' ? 'block' : 'none';
 		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
 		statusMode = mode;
+	}
+
+	function setStatusLine(text) {
+		statusLine.textContent = text;
 	}
 
 	function setStatusNotice(text) {
@@ -158,49 +237,90 @@ const engine = new Engine(GODOT_CONFIG);
 		} else {
 			setStatusNotice('An unknown error occurred.');
 		}
+		statusStart.style.display = 'none';
+		statusHint.style.display = 'none';
+		statusProgress.style.display = 'none';
 		setStatusMode('notice');
 		initializing = false;
 	}
 
-	const missing = Engine.getMissingFeatures({
-		threads: GODOT_THREADS_ENABLED,
-	});
+	const sharedBytes = (GODOT_CONFIG['fileSizes'] || {})['index.wasm'] || 0;
+	const pckBytes = (GODOT_CONFIG['fileSizes'] || {})['index.pck'] || 0;
+	const totalBytes = sharedBytes + pckBytes;
+	function mb(bytes) {
+		return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+	}
 
-	if (missing.length !== 0) {
-		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
-			let serviceWorkerRegistrationPromise;
-			try {
-				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
-			} catch (err) {
-				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+	// iOS and Android only let a page create a running AudioContext, and only
+	// start an AudioWorklet, once a real gesture has happened. Godot's stock
+	// shell boots the engine with no gesture at all, which is where a phone
+	// sticks on the loading screen. So: wait for the tap, unlock audio inside
+	// that gesture, and only then start the engine.
+	function unlockAudio() {
+		try {
+			const Ctx = window.AudioContext || window.webkitAudioContext;
+			if (!Ctx) {
+				return;
 			}
-			// There's a chance that installing the service worker would fix the issue
-			Promise.race([
-				serviceWorkerRegistrationPromise.then((registration) => {
-					if (registration != null) {
-						return Promise.reject(new Error('Service worker already exists.'));
-					}
-					return registration;
-				}).then(() => engine.installServiceWorker()),
-				// For some reason, `getRegistration()` can stall
-				new Promise((resolve) => {
-					setTimeout(() => resolve(), 2000);
-				}),
-			]).then(() => {
-				// Reload if there was no error.
-				window.location.reload();
-			}).catch((err) => {
-				console.error('Error while registering service worker:', err);
+			const ctx = new Ctx();
+			const resume = ctx.state === 'running' ? Promise.resolve() : ctx.resume();
+			Promise.resolve(resume).catch(() => {}).then(() => {
+				try {
+					const buf = ctx.createBuffer(1, 1, 22050);
+					const src = ctx.createBufferSource();
+					src.buffer = buf;
+					src.connect(ctx.destination);
+					src.start(0);
+				} catch (e) {
+					// A silent blip is only here to open the audio session.
+				}
+				setTimeout(() => { try { ctx.close(); } catch (e) {} }, 250);
 			});
-		} else {
-			// Display the message as usual
+		} catch (e) {
+			// No audio support: the game still runs, just silent.
+		}
+	}
+
+	function startNow() {
+		if (started) {
+			return;
+		}
+		started = true;
+		startedAt = Date.now();
+
+		const missing = Engine.getMissingFeatures({
+			threads: GODOT_THREADS_ENABLED,
+		});
+
+		if (missing.length !== 0) {
 			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
 			displayFailureNotice(missingMsg + missing.join('\n'));
+			return;
 		}
-	} else {
+
+		unlockAudio();
 		setStatusMode('progress');
+		setStatusLine('Starting engine…');
+		setInterval(() => {
+			if (!started) {
+				return;
+			}
+			const secs = Math.round((Date.now() - startedAt) / 1000);
+			if (!initializing) {
+				return;
+			}
+			if (loadedBytes > 0) {
+				setStatusLine(loadedBytes >= totalBytes
+					? 'Loaded ' + mb(loadedBytes) + ' — building the night (' + secs + 's)'
+					: 'Loading ' + mb(loadedBytes) + ' of ' + mb(totalBytes) + ' (' + secs + 's)');
+			} else {
+				setStatusLine('Starting engine… (' + secs + 's)');
+			}
+		}, 1000);
+
 		engine.startGame({
 			'onProgress': function (current, total) {
+				loadedBytes = current;
 				if (current > 0 && total > 0) {
 					statusProgress.value = current;
 					statusProgress.max = total;
@@ -213,6 +333,23 @@ const engine = new Engine(GODOT_CONFIG);
 			setStatusMode('hidden');
 		}, displayFailureNotice);
 	}
+
+	setStatusMode('ready');
+	statusHint.textContent = totalBytes > 0
+		? mb(totalBytes) + ' — keep this tab open while it loads.'
+		: 'Keep this tab open while it loads.';
+
+	statusStart.addEventListener('click', startNow);
+	statusStart.addEventListener('touchend', function (e) {
+		e.preventDefault();
+		startNow();
+	});
+	statusOverlay.addEventListener('keydown', function (e) {
+		if (e.key === 'Enter' || e.key === ' ') {
+			e.preventDefault();
+			startNow();
+		}
+	});
 }());
 		</script>
 	</body>
