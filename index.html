@@ -177,7 +177,7 @@ body {
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":54268444,"index.wasm":39358703},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":54268940,"index.wasm":39358703},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
@@ -194,6 +194,10 @@ const engine = new Engine(GODOT_CONFIG);
 	let started = false;
 	let startedAt = 0;
 	let loadedBytes = 0;
+	let pckLoaded = 0;
+	let wasmLoaded = 0;
+	let packFromDisk = false;
+	let phase = 'Starting engine…';
 
 	function setStatusMode(mode) {
 		if (statusMode === mode || !initializing) {
@@ -249,6 +253,161 @@ const engine = new Engine(GODOT_CONFIG);
 	const totalBytes = sharedBytes + pckBytes;
 	function mb(bytes) {
 		return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+	}
+
+	// ---------------------------------------------------------- saved data --
+	// The pack is the whole download, and it is the file that changes with
+	// every build. Keeping the last one in Cache Storage means the phone pays
+	// for it once: the next start reads it off disk and only asks the server
+	// whether it is still current (a 304 that carries no body). A new build
+	// answers 200 instead, and that response *is* the new pack, so it is used
+	// and stored without a second download.
+	const PACK_PATH = GODOT_CONFIG['mainPack']
+		|| (GODOT_CONFIG['executable'] || 'index') + '.pck';
+	const PACK_URL = new URL(PACK_PATH, document.baseURI).href;
+	const PACK_CACHE = 'onav-pack-v1';
+
+	async function openPackCache() {
+		if (!('caches' in window)) {
+			return null;
+		}
+		try {
+			return await caches.open(PACK_CACHE);
+		} catch (e) {
+			return null;
+		}
+	}
+
+	function drawProgress() {
+		loadedBytes = pckLoaded + wasmLoaded;
+		if (loadedBytes > 0 && totalBytes > 0) {
+			statusProgress.value = loadedBytes;
+			statusProgress.max = totalBytes;
+		} else {
+			statusProgress.removeAttribute('value');
+			statusProgress.removeAttribute('max');
+		}
+	}
+
+	// Reads a pack response with progress, then keeps a copy on the device.
+	async function readPack(resp, cache) {
+		const total = Number(resp.headers.get('content-length')) || 0;
+		let buf;
+		if (resp.body && resp.body.getReader) {
+			const reader = resp.body.getReader();
+			const chunks = [];
+			let size = 0;
+			pckLoaded = 0;
+			for (;;) {
+				const step = await reader.read();
+				if (step.done) {
+					break;
+				}
+				chunks.push(step.value);
+				size += step.value.length;
+				pckLoaded = size;
+				drawProgress();
+			}
+			const bytes = new Uint8Array(size);
+			let at = 0;
+			for (const chunk of chunks) {
+				bytes.set(chunk, at);
+				at += chunk.length;
+			}
+			buf = bytes.buffer;
+		} else {
+			buf = await resp.arrayBuffer();
+			pckLoaded = buf.byteLength;
+			drawProgress();
+		}
+		if (cache) {
+			const tag = resp.headers.get('etag') || '';
+			const modified = resp.headers.get('last-modified') || '';
+			cache.put(PACK_URL, new Response(buf, {
+				headers: {
+					'content-type': 'application/octet-stream',
+					'x-onav-tag': tag,
+					'x-onav-lm': modified,
+					'x-onav-size': String(buf.byteLength || total),
+				},
+			})).catch(() => {});
+		}
+		return buf;
+	}
+
+	// The pack, from this device if it is still current, from the network if not.
+	async function loadPack() {
+		const cache = await openPackCache();
+		const hit = cache ? await cache.match(PACK_URL).catch(() => null) : null;
+		if (hit) {
+			const tag = hit.headers.get('x-onav-tag') || '';
+			const modified = hit.headers.get('x-onav-lm') || '';
+			if (tag || modified) {
+				const headers = {};
+				if (tag) {
+					headers['If-None-Match'] = tag;
+				}
+				if (modified) {
+					headers['If-Modified-Since'] = modified;
+				}
+				try {
+					setStatusLine('Checking the game data on this device…');
+					const probe = await fetch(PACK_URL, { headers: headers, cache: 'no-store' });
+					if (probe.status === 304) {
+						packFromDisk = true;
+						pckLoaded = Number(hit.headers.get('x-onav-size')) || 0;
+						drawProgress();
+						setStatusLine('Game data is on this device — no download needed.');
+						return await hit.arrayBuffer();
+					}
+					if (probe.ok) {
+						phase = 'Downloading the new build';
+						setStatusLine('New build — downloading the game data…');
+						return await readPack(probe, cache);
+					}
+					if (probe.body) {
+						try { probe.body.cancel(); } catch (e) {}
+					}
+				} catch (e) {
+					// offline: the copy on this device is all there is
+					packFromDisk = true;
+					pckLoaded = Number(hit.headers.get('x-onav-size')) || 0;
+					drawProgress();
+					return await hit.arrayBuffer();
+				}
+			}
+		}
+		phase = 'Downloading the game data';
+		setStatusLine('Downloading the game data…');
+		const resp = await fetch(PACK_URL);
+		if (!resp.ok) {
+			throw new Error('Could not download the game data (' + resp.status + ').');
+		}
+		return await readPack(resp, cache);
+	}
+
+	// Does this device already hold the current pack? Used only for the ready
+	// line, so it asks with HEAD: a stale copy must never cost a download here,
+	// and the real load checks again before it uses what is on disk.
+	async function packOnDevice() {
+		const cache = await openPackCache();
+		if (!cache) {
+			return false;
+		}
+		const hit = await cache.match(PACK_URL).catch(() => null);
+		if (!hit) {
+			return false;
+		}
+		const tag = hit.headers.get('x-onav-tag') || '';
+		if (!tag) {
+			return false;
+		}
+		try {
+			const head = await fetch(PACK_URL, { method: 'HEAD', cache: 'no-store' });
+			return head.ok && (head.headers.get('etag') || '') === tag;
+		} catch (e) {
+			return true;
+		}
 	}
 
 	// iOS and Android only let a page create a running AudioContext, and only
@@ -314,23 +473,25 @@ const engine = new Engine(GODOT_CONFIG);
 					? 'Loaded ' + mb(loadedBytes) + ' — building the night (' + secs + 's)'
 					: 'Loading ' + mb(loadedBytes) + ' of ' + mb(totalBytes) + ' (' + secs + 's)');
 			} else {
-				setStatusLine('Starting engine… (' + secs + 's)');
+				setStatusLine(phase + ' (' + secs + 's)');
 			}
 		}, 1000);
 
-		engine.startGame({
-			'onProgress': function (current, total) {
-				loadedBytes = current;
-				if (current > 0 && total > 0) {
-					statusProgress.value = current;
-					statusProgress.max = total;
-				} else {
-					statusProgress.removeAttribute('value');
-					statusProgress.removeAttribute('max');
-				}
-			},
+		// The pack arrives as bytes rather than as a URL, so the engine cannot
+		// be asked to download it: hand it the data and start by hand. That is
+		// the only reason this does not just call `engine.startGame()`.
+		loadPack().then(function (pack) {
+			engine.config.args = ['--main-pack', PACK_PATH];
+			engine.config.onProgress = function (current) {
+				wasmLoaded = current;
+				drawProgress();
+			};
+			return engine.preloadFile(pack, PACK_PATH)
+				.then(() => engine.init(GODOT_CONFIG['executable']))
+				.then(() => engine.start());
 		}).then(() => {
 			setStatusMode('hidden');
+			console.log('[onav] started from ' + (packFromDisk ? 'this device' : 'the network'));
 		}, displayFailureNotice);
 	}
 
@@ -345,6 +506,11 @@ const engine = new Engine(GODOT_CONFIG);
 	statusHint.textContent = totalBytes > 0
 		? mb(totalBytes) + ' — keep this tab open while it loads.'
 		: 'Keep this tab open while it loads.';
+	packOnDevice().then((saved) => {
+		if (saved && statusMode === 'ready') {
+			statusHint.textContent = 'Game data is saved on this device — it starts without downloading.';
+		}
+	});
 
 	statusStart.addEventListener('click', startNow);
 	statusStart.addEventListener('touchend', function (e) {
